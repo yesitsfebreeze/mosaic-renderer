@@ -13,6 +13,52 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 MOSAIC_REPOSITORY = "https://github.com/yesitsfebreeze/mosaic.git"
 MOSAIC_REVISION = "ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5"
+LLVM_SETUP_RECIPE = "dev/wf/setup-llvm.wf.md"
+LLVM_HASH_OLD = "    $recipeHash = (Get-FileHash -LiteralPath '(Get-Location).Path/justfile').Hash"
+LLVM_HASH_FIXED = "    $recipeHash = (Get-FileHash -LiteralPath (Join-Path $repoRoot 'dev/wf/setup-llvm.wf.md') -Algorithm SHA256).Hash"
+BOOTSTRAP_RECIPE = "dev/wf/build.wf.md"
+BOOTSTRAP_STAGE_OLD = """        & tar -x -f $stageArchive -C $stageRoot
+        if ($LASTEXITCODE -ne 0) { throw 'Could not extract the bootstrap stage sources' }
+        $stageCompiler = Join-Path $stageRoot $exeName
+        $previousRoot = $env:MOSAIC_ROOT
+        $env:MOSAIC_ROOT = Join-Path $stageRoot 'src'
+        Push-Location $stageRoot
+        try {
+            & $seed build (Join-Path $stageRoot 'src/compiler/cmd') "-collection:compiler=$(Join-Path $stageRoot 'src')" "-out:$stageCompiler" -o:speed
+        } finally {
+            Pop-Location
+            $env:MOSAIC_ROOT = $previousRoot
+        }"""
+BOOTSTRAP_STAGE_FIXED = BOOTSTRAP_STAGE_OLD.replace(
+    "        & tar -x -f $stageArchive -C $stageRoot",
+    """        $stageTar = if ($IsWindows) { Join-Path $env:SystemRoot 'System32/tar.exe' } else { 'tar' }
+        & $stageTar -x -f $stageArchive -C $stageRoot""",
+).replace(
+    "        $stageCompiler = Join-Path $stageRoot $exeName",
+    """        $stageToolchain = $null
+        if ($IsWindows) {
+            $preparedToolchain = Join-Path $repoRoot '.mosaic/cache/toolchain'
+            foreach ($library in @('bin/llvm/windows/LLVM-static.lib', 'bin/tommath/windows/tommath.lib')) {
+                if (-not (Test-Path -LiteralPath (Join-Path $preparedToolchain $library) -PathType Leaf)) { throw "Missing prepared bootstrap library: $library" }
+            }
+            $stageCache = Join-Path $stageRoot '.mosaic/cache'
+            [IO.Directory]::CreateDirectory($stageCache) | Out-Null
+            $junction = Join-Path $stageCache 'toolchain'
+        }
+        $stageCompiler = Join-Path $stageRoot $exeName""",
+).replace(
+    "        try {\n            & $seed",
+    """        try {
+            if ($IsWindows) {
+                New-Item -ItemType Junction -Path $junction -Target $preparedToolchain | Out-Null
+                $stageToolchain = $junction
+            }
+            & $seed""",
+).replace(
+    "            $env:MOSAIC_ROOT = $previousRoot",
+    """            $env:MOSAIC_ROOT = $previousRoot
+            if ($stageToolchain) { [IO.Directory]::Delete($stageToolchain) }""",
+)
 SHADERS = ("voxel.vert", "voxel.frag")
 
 
@@ -61,6 +107,42 @@ def mosaic_toolchain(checkout, explicit=None):
     return checkout, compiler, env
 
 
+def correct_mosaic_workflows(checkout, git):
+    """Validate both recorded corrections before changing either pinned workflow."""
+    corrections = ((LLVM_SETUP_RECIPE, LLVM_HASH_OLD, LLVM_HASH_FIXED),
+                   (BOOTSTRAP_RECIPE, BOOTSTRAP_STAGE_OLD, BOOTSTRAP_STAGE_FIXED))
+    status = subprocess.run(
+        [git, "-C", str(checkout), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        check=True, text=True, capture_output=True,
+    ).stdout
+    allowed = {f" M {path}" for path, _, _ in corrections}
+    if any(entry not in allowed for entry in status.split("\0") if entry):
+        raise BuildError(f"Tool checkout is dirty; preserve its changes and choose an empty directory: {checkout}")
+    modes = subprocess.run([git, "-C", str(checkout), "diff", "--summary"], check=True, capture_output=True).stdout
+    if modes:
+        raise BuildError(f"Tool checkout is dirty (file metadata changed): {checkout}")
+    pending = []
+    for path, before, after in corrections:
+        original = subprocess.run([git, "-C", str(checkout), "show", f"HEAD:{path}"], check=True, capture_output=True).stdout
+        if original.count(before.encode("utf-8")) != 1:
+            raise BuildError(f"Pinned workflow has unexpected content: {path}; no corrections were applied.")
+        original = subprocess.run([git, "-C", str(checkout), "cat-file", "--filters", f"HEAD:{path}"], check=True, capture_output=True).stdout
+        newline = b"\r\n" if b"\r\n" in original else b"\n"
+        old = before.encode("utf-8").replace(b"\n", newline)
+        new = after.encode("utf-8").replace(b"\n", newline)
+        if original.count(old) != 1:
+            raise BuildError(f"Pinned workflow has unexpected content after Git checkout filters: {path}")
+        corrected = original.replace(old, new, 1)
+        current = (checkout / path).read_bytes()
+        if current not in (original, corrected):
+            raise BuildError(f"Tool checkout has unexpected changes in {path}; preserve them before setup.")
+        if current == original:
+            pending.append((path, corrected))
+    for path, corrected in pending:
+        (checkout / path).write_bytes(corrected)
+        print(f"Applied renderer's pinned workflow correction: {path}")
+
+
 def setup_mosaic(directory):
     checkout = Path(directory).expanduser().resolve()
     git = executable(None, ["git"], "Git")
@@ -84,8 +166,7 @@ def setup_mosaic(directory):
         raise BuildError(f"Tool directory is an unrelated checkout: {checkout}")
     if git_text("rev-parse", "HEAD") != MOSAIC_REVISION:
         raise BuildError(f"Tool checkout has a different revision; choose an empty directory with --mosaic-root: {checkout}")
-    if git_text("status", "--porcelain", "--untracked-files=all"):
-        raise BuildError(f"Tool checkout is dirty; preserve its changes and choose an empty directory: {checkout}")
+    correct_mosaic_workflows(checkout, git)
     env = dict(os.environ)
     env["MOSAIC_ROOT"] = str(checkout / "src")
     env["MOSAIC_BOOTSTRAP_REMOTE"] = "origin"

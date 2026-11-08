@@ -27,9 +27,26 @@ ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5
 
 It runs Mosaic's official `wf.mjs run setup` and `wf.mjs run bootstrap` there,
 then checks that checkout's `bin/mosaic` (`mosaic.exe` on Windows). Bootstrap
-builds from Mosaic's private C++ seed and pinned stage compiler. A clean checkout
-at the exact revision can be reused after a failed build. An existing directory
-with another repository, revision or source changes is refused.
+builds from Mosaic's private C++ seed and pinned stage compiler. The checkout
+can be reused after a failed build; downloaded archives and LLVM caches are kept.
+An existing directory with another repository, revision or source changes is refused,
+apart from the two recorded workflow corrections described below.
+
+At this pin, `dev/wf/setup-llvm.wf.md` tries to hash a literal
+`(Get-Location).Path/justfile` path. Renderer setup corrects that single line to
+hash the actual LLVM workflow file with SHA-256, so LLVM's cache records track
+the recipe that produced them. Setup also corrects the bootstrap stage in
+`dev/wf/build.wf.md`: it uses Windows' System32 tar for drive-letter paths and
+temporarily exposes the prepared native toolchain to the extracted stage sources
+through a directory junction. Required LLVM and tommath libraries are checked
+first. The junction is removed after stage compilation, including on failure;
+the original toolchain cache is retained.
+
+These are renderer-owned dependency corrections. The Mosaic revision stays
+pinned, and no archive checksum is changed. Setup checks both complete workflow
+files against their committed originals and Git checkout filters before writing
+either. Retries accept exactly these unstaged changes; other edits, file mode
+changes, staged changes and untracked source files are refused.
 
 Setup requires Git authenticated for the private
 [Mosaic repository](https://github.com/yesitsfebreeze/mosaic), Node.js 22+, Python
@@ -70,7 +87,11 @@ If `spirv-val` is installed, the build also validates their SPIR-V.
 
 ## Checks
 
-CI runs Python build checks, compiles and validates the Vulkan shaders, and runs
+CI runs Python build checks on Linux and Windows. The Windows job also executes
+the corrected PowerShell hash expression and bootstrap stage with paths containing
+spaces. It checks recipe cache hashes, real tar extraction, native library/helper
+access through the junction, failure handling and preservation of the root cache.
+These fixtures do not compile Mosaic. Linux compiles and validates the Vulkan shaders and runs
 77 geometry fixtures using the actual intersection code through WebGL2/SwiftShader.
 Native Mosaic compilation, Vulkan window creation and hardware performance remain
 separate target-machine checks.
