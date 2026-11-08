@@ -11,54 +11,52 @@ global illumination and multiple chunks are subsequent milestones.
 
 ## Build and run
 
-Requirements: Python 3.9+, a built Mosaic checkout, the Vulkan SDK's `glslc` or
-`glslangValidator`, and a Vulkan 1.3 device/driver. The runtime provides a Win32
-backend and a GLFW backend for Linux/macOS. Each platform still needs a native
-build and graphics check; this repository does not include a prebuilt executable.
+From the renderer repository:
 
-Mosaic's Vulkan runtime is an external dependency. Its repository is currently
-private, so access to [yesitsfebreeze/mosaic](https://github.com/yesitsfebreeze/mosaic)
-is required. Use this source revision:
+```sh
+python tools/build.py setup
+python tools/build.py run
+```
+
+Use `python3` if that is your Python command. `setup` checks out the required
+Mosaic source into ignored `vendor/mosaic`, detached at this required revision from Mosaic's `main` history:
 
 ```text
 ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5
 ```
 
-You can use an existing checkout at that revision, or create a separate one:
+It runs Mosaic's official `wf.mjs run setup` and `wf.mjs run bootstrap` there,
+then checks that checkout's `bin/mosaic` (`mosaic.exe` on Windows). Bootstrap
+builds from Mosaic's private C++ seed and pinned stage compiler. A clean checkout
+at the exact revision can be reused after a failed build. An existing directory
+with another repository, revision or source changes is refused.
 
-```sh
-git clone https://github.com/yesitsfebreeze/mosaic.git vendor/mosaic
-git -C vendor/mosaic checkout ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5
-```
+Setup requires Git authenticated for the private
+[Mosaic repository](https://github.com/yesitsfebreeze/mosaic), Node.js 22+, Python
+3.9+, and Mosaic's [native build prerequisites](https://github.com/yesitsfebreeze/mosaic/blob/ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5/dev/README.md).
+On Windows, install PowerShell 7 and Visual Studio's C++ tools with its CMake/Ninja
+component. The first Windows setup builds LLVM 22.1.8 from source and can take
+substantial time; `MOSAIC_LLVM_JOBS` controls its parallelism. Later setup retries
+reuse that cache.
 
-Build Mosaic following its [development instructions](https://github.com/yesitsfebreeze/mosaic/blob/ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5/dev/README.md).
-From the Mosaic checkout, the current commands are:
+Rendering also requires the Vulkan SDK's `glslc` or `glslangValidator` and a Vulkan
+1.3 device/driver. Linux links system GLFW. `setup` does not require a shader
+compiler; `doctor` checks the rendering build dependencies. Native window creation
+and performance still need verification on the target machine.
 
-```sh
-node dev/skill/scripts/wf.mjs run setup
-node dev/skill/scripts/wf.mjs run build
-```
-
-The compiler's first build needs its documented native toolchain and may take
-time. Linux also links the system GLFW library. The renderer build itself does
-not download dependencies or rebuild the compiler. Back in this repository:
-
-```sh
-python tools/build.py doctor
-python tools/build.py run
-```
-
-Use `python3` if that is your Python command. With an existing Mosaic checkout:
+`run` uses the selected checkout's compiler by default. An existing compatible
+checkout can be selected explicitly:
 
 ```sh
 python tools/build.py run --mosaic-root ../mosaic
 ```
 
-`--compiler` selects a different Mosaic executable; otherwise the script uses
-`MOSAIC_COMPILER` or the selected checkout's `bin/mosaic` (`mosaic.exe` on Windows).
-`--shader-compiler` selects `glslc` or `glslangValidator`. The build sets Mosaic's
-`MOSAIC_ROOT` to the checkout's **src directory**, and adds its example runtime
-through the `mosaic_runtime` collection.
+Use `setup --mosaic-root <empty-directory>` to prepare a different isolated tool
+directory. `--compiler` deliberately overrides the compiler for build/run, and
+`--shader-compiler` selects the shader compiler. The build sets `MOSAIC_ROOT` to
+the selected checkout's **src directory** and exposes its runtime through the
+`mosaic_runtime` collection. Normal build/run commands do not download dependencies
+or rebuild Mosaic.
 
 ```sh
 python tools/build.py shaders  # Compile GLSL without requiring Mosaic
@@ -73,7 +71,7 @@ If `spirv-val` is installed, the build also validates their SPIR-V.
 ## Checks
 
 CI runs Python build checks, compiles and validates the Vulkan shaders, and runs
-70 geometry fixtures using the actual intersection code through WebGL2/SwiftShader.
+77 geometry fixtures using the actual intersection code through WebGL2/SwiftShader.
 Native Mosaic compilation, Vulkan window creation and hardware performance remain
 separate target-machine checks.
 

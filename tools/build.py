@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Mosaic Renderer using an existing Mosaic checkout and Vulkan SDK."""
+"""Set up the local Mosaic toolchain and build Mosaic Renderer."""
 
 import argparse
 import os
@@ -11,6 +11,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+MOSAIC_REPOSITORY = "https://github.com/yesitsfebreeze/mosaic.git"
 MOSAIC_REVISION = "ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5"
 SHADERS = ("voxel.vert", "voxel.frag")
 
@@ -40,11 +41,11 @@ def mosaic_toolchain(checkout, explicit=None):
     checkout = Path(checkout).expanduser().resolve()
     for required in ("src/core", "dev/examples/voxel/runtime/vk/gfx"):
         if not (checkout / required).is_dir():
-            raise BuildError(f"Mosaic checkout is missing {required}: {checkout}. Use --mosaic-root <checkout>.")
+            raise BuildError(f"Mosaic checkout is missing {required}: {checkout}. Run python tools/build.py setup, or use --mosaic-root <matching checkout>.")
     compiler = executable(
-        explicit or os.environ.get("MOSAIC_COMPILER"),
+        explicit,
         [checkout / "bin" / ("mosaic.exe" if os.name == "nt" else "mosaic")],
-        "Mosaic compiler (build Mosaic in that checkout first)",
+        "Mosaic compiler (run python tools/build.py setup first)",
     )
     if (checkout / ".git").exists():
         revision = subprocess.run(
@@ -52,12 +53,51 @@ def mosaic_toolchain(checkout, explicit=None):
             check=True, text=True, capture_output=True,
         ).stdout.strip()
         if revision != MOSAIC_REVISION:
-            raise BuildError(f"Mosaic revision is {revision}; expected {MOSAIC_REVISION}. Use a checkout at the pinned revision.")
+            raise BuildError(f"Mosaic revision is {revision}; expected {MOSAIC_REVISION}. Run python tools/build.py setup for an isolated local toolchain.")
     else:
         raise BuildError("Mosaic must be a Git checkout so its pinned source revision can be verified.")
     env = dict(os.environ)
     env["MOSAIC_ROOT"] = str(checkout / "src")
     return checkout, compiler, env
+
+
+def setup_mosaic(directory):
+    checkout = Path(directory).expanduser().resolve()
+    git = executable(None, ["git"], "Git")
+    node = executable(None, ["node"], "Node.js (Mosaic setup requires Node 22+)")
+    if checkout.exists() and not checkout.is_dir():
+        raise BuildError(f"Tool path is not a directory: {checkout}")
+    if not checkout.exists() or not any(checkout.iterdir()):
+        checkout.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([git, "clone", "--no-checkout", MOSAIC_REPOSITORY, str(checkout)], check=True)
+        subprocess.run([git, "-C", str(checkout), "checkout", "--detach", MOSAIC_REVISION], check=True)
+    if not (checkout / ".git").exists():
+        raise BuildError(f"Tool directory is not a Git checkout; choose an empty directory: {checkout}")
+
+    def git_text(*args):
+        return subprocess.run([git, "-C", str(checkout), *args], check=True, text=True, capture_output=True).stdout.strip()
+
+    def repository_url(url):
+        return url.removesuffix(".git").replace("git@github.com:", "https://github.com/").replace("ssh://git@github.com/", "https://github.com/")
+
+    if repository_url(git_text("remote", "get-url", "origin")) != repository_url(MOSAIC_REPOSITORY):
+        raise BuildError(f"Tool directory is an unrelated checkout: {checkout}")
+    if git_text("rev-parse", "HEAD") != MOSAIC_REVISION:
+        raise BuildError(f"Tool checkout has a different revision; choose an empty directory with --mosaic-root: {checkout}")
+    if git_text("status", "--porcelain", "--untracked-files=all"):
+        raise BuildError(f"Tool checkout is dirty; preserve its changes and choose an empty directory: {checkout}")
+    env = dict(os.environ)
+    env["MOSAIC_ROOT"] = str(checkout / "src")
+    env["MOSAIC_BOOTSTRAP_REMOTE"] = "origin"
+    env["MOSAIC_BOOTSTRAP_BRANCH"] = "bootstrap"
+    for name in ("MOSAIC_BUILD_COMPILER", "MOSAIC_BUILD_SELF_ONLY", "MOSAIC_BUILD_LANE", "MOSAIC_BUILD_NO_INSTALL"):
+        env.pop(name, None)
+    for workflow in ("setup", "bootstrap"):
+        subprocess.run([node, "dev/skill/scripts/wf.mjs", "run", workflow], cwd=checkout, env=env, check=True)
+    owned_compiler = checkout / "bin" / ("mosaic.exe" if os.name == "nt" else "mosaic")
+    _, compiler, _ = mosaic_toolchain(checkout, str(owned_compiler))
+    subprocess.run([compiler, "version"], cwd=checkout, env=env, check=True)
+    print(f"Mosaic toolchain ready: {checkout}")
 
 
 def spirv_words(data, name):
@@ -110,13 +150,16 @@ def build_command(compiler, checkout, output, debug=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("doctor", "shaders", "build", "run"), nargs="?", default="build")
+    parser.add_argument("command", choices=("setup", "doctor", "shaders", "build", "run"), nargs="?", default="build")
     parser.add_argument("--mosaic-root", type=Path, default=ROOT / "vendor" / "mosaic", help="Mosaic repository checkout (not its src directory)")
-    parser.add_argument("--compiler", help="Mosaic executable; otherwise MOSAIC_COMPILER or <checkout>/bin/mosaic")
+    parser.add_argument("--compiler", help="Explicit Mosaic executable for build/run; default <checkout>/bin/mosaic")
     parser.add_argument("--shader-compiler", help="glslc or glslangValidator executable")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if args.command == "setup":
+            setup_mosaic(args.mosaic_root)
+            return 0
         glsl = shader_compiler(args.shader_compiler)
         if args.command == "shaders":
             compile_shaders(glsl)
