@@ -107,7 +107,7 @@ class ToolchainSetupChecks(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="renderer tool ")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.origin = self.root / "source"
         self.origin.mkdir()
         for path in ("src/core/fixture.mi", "dev/examples/voxel/runtime/vk/gfx/fixture.mi", "dev/skill/scripts/wf.mjs"):
@@ -229,7 +229,7 @@ class ToolchainSetupChecks(unittest.TestCase):
     def test_bootstrap_stage_extracts_and_cleans_junction_on_success_and_failure(self):
         build.setup_mosaic(self.checkout)
         native = self.checkout / ".mosaic/cache/toolchain"
-        files = ("bin/llvm/windows/LLVM-static.lib", "bin/tommath/windows/tommath.lib", "bin/lld-link.exe", "bin/vsfind.exe", "sentinel")
+        files = ("bin/llvm/windows/LLVM-static.lib", "bin/tommath/windows/tommath.lib", "bin/lld-link.exe", "bin/msvcfind/windows/vsfind.exe", "sentinel")
         for name in files:
             path = native / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -244,7 +244,7 @@ class ToolchainSetupChecks(unittest.TestCase):
         script.write_text("param($repoRoot, $stageArchive, $stageRoot, $mode)\n$ErrorActionPreference = 'Stop'\n"
                           "$exeName = 'mosaic.exe'\n$seed = 'Invoke-FixtureSeed'\n"
                           "function Invoke-FixtureSeed {\n"
-                          "  foreach ($name in @('bin/llvm/windows/LLVM-static.lib', 'bin/tommath/windows/tommath.lib', 'bin/lld-link.exe', 'bin/vsfind.exe')) {\n"
+                          "  foreach ($name in @('bin/llvm/windows/LLVM-static.lib', 'bin/tommath/windows/tommath.lib', 'bin/lld-link.exe', 'bin/msvcfind/windows/vsfind.exe')) {\n"
                           "    $value = [IO.File]::ReadAllText((Join-Path $stageRoot ('.mosaic/cache/toolchain/' + $name)))\n"
                           "    if ($value -ne $name) { throw 'Bad staged native library/helper' }\n  }\n"
                           "  if ($mode -eq 'fail') { throw 'fixture compile failure' }\n"
