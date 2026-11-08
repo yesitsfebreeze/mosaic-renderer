@@ -28,10 +28,17 @@ ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5
 
 It runs Mosaic's official `wf.mjs run setup` and `wf.mjs run bootstrap` there,
 then checks that checkout's `bin/mosaic` (`mosaic.exe` on Windows). Bootstrap
-builds from Mosaic's private C++ seed and pinned stage compiler. The checkout
-can be reused after a failed build; downloaded archives and LLVM caches are kept.
+builds from Mosaic's private C++ seed and pinned stage compiler. Setup prints
+phase labels, identifies Windows vendor downloads, and streams output from nested
+workflows as they run.
+
+If setup fails or is interrupted, rerun the same command and keep `vendor/mosaic`.
+Completed downloads and LLVM source/object caches are reused; interrupted downloads
+may restart. During setup/bootstrap workflows, Ctrl+C stops their child process
+tree so held cache locks are released, then exits with code 130 and a short
+cancellation message.
 An existing directory with another repository, revision or source changes is refused,
-apart from the two recorded workflow corrections described below.
+apart from the recorded dependency corrections described below.
 
 At this pin, `dev/wf/setup-llvm.wf.md` tries to hash a literal
 `(Get-Location).Path/justfile` path. Renderer setup corrects that single line to
@@ -43,19 +50,26 @@ through a directory junction. Required LLVM and tommath libraries are checked
 first. The junction is removed after stage compilation, including on failure;
 the original toolchain cache is retained.
 
+Setup also corrects `dev/wf/setup.wf.md` to label individual Windows downloads,
+and `dev/skill/scripts/wf.mjs` and `dev/skill/scripts/lib/wfmd.mjs` to support live
+output through nested workflows. Renderer setup enables this mode; normal
+structured workflow capture remains available. These progress changes do not
+reduce LLVM compilation work.
+
 These are renderer-owned dependency corrections. The Mosaic revision stays
-pinned, and no archive checksum is changed. Setup checks both complete workflow
-files against their committed originals and Git checkout filters before writing
-either. Retries accept exactly these unstaged changes; other edits, file mode
+pinned, and no archive checksum is changed. Setup checks all guarded files
+against their committed originals and Git checkout filters before changing any
+of them. Retries accept exactly these unstaged changes; other edits, file mode
 changes, staged changes and untracked source files are refused.
 
 Setup requires Git authenticated for the private
 [Mosaic repository](https://github.com/yesitsfebreeze/mosaic), Node.js 22+, Python
 3.9+, and Mosaic's [native build prerequisites](https://github.com/yesitsfebreeze/mosaic/blob/ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5/dev/README.md).
 On Windows, install PowerShell 7 and Visual Studio's C++ tools with its CMake/Ninja
-component. The first Windows setup builds LLVM 22.1.8 from source and can take
-substantial time; `MOSAIC_LLVM_JOBS` controls its parallelism. Later setup retries
-reuse that cache.
+component. A cold Windows setup downloads vendor libraries and the pinned tool
+archive, then builds LLVM 22.1.8 from source. This can take substantial time;
+`MOSAIC_LLVM_JOBS` controls LLVM build parallelism. Later setup retries reuse
+completed downloads and the LLVM build cache.
 
 Rendering also requires the Vulkan SDK's `glslc` or `glslangValidator` and a Vulkan
 1.3 device/driver. Linux links system GLFW. `setup` does not require a shader
@@ -88,7 +102,10 @@ If `spirv-val` is installed, the build also validates their SPIR-V.
 
 ## Checks
 
-CI runs Python build checks on Linux and Windows. The Windows job also executes
+CI runs Python build checks on Linux and Windows. Node.js is required for the
+workflow-output regression checks. Cancellation checks start a real descendant
+holding an OS file lock and verify that the lock can be reacquired after cleanup.
+The Windows job also executes
 the corrected PowerShell hash expression and bootstrap stage with paths containing
 spaces. It checks recipe cache hashes, real tar extraction, native library/helper
 access through the junction, failure handling and preservation of the root cache.

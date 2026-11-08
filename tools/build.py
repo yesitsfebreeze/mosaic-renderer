@@ -5,6 +5,7 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -59,6 +60,41 @@ BOOTSTRAP_STAGE_FIXED = BOOTSTRAP_STAGE_OLD.replace(
     """            $env:MOSAIC_ROOT = $previousRoot
             if ($stageToolchain) { [IO.Directory]::Delete($stageToolchain) }""",
 )
+WORKFLOW_RUNNER = "dev/skill/scripts/lib/wfmd.mjs"
+WORKFLOW_CAPTURE_OLD = """export function runCommand(command, cwd, { timeoutMs = 0, maxBytes = 256 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const child = spawn(command[0], command.slice(1), { cwd, windowsHide: true });
+    let stdout = '', stderr = '', truncated = false, timedOut = false;
+    const collect = (target, chunk) => {
+      if (target.length >= maxBytes) { truncated = true; return target; }
+      const value = chunk.toString();
+      if (target.length + value.length > maxBytes) truncated = true;
+      return target + value.slice(0, maxBytes - target.length);
+    };
+    child.stdout.on('data', chunk => { stdout = collect(stdout, chunk); });
+    child.stderr.on('data', chunk => { stderr = collect(stderr, chunk); });
+    const timer = timeoutMs ? setTimeout(() => { timedOut = true; child.kill(); }, timeoutMs) : null;
+    child.on('error', reject);
+    child.on('close', (code, signal) => {
+      if (timer) clearTimeout(timer);
+      resolve({ exit_code: code, signal, timed_out: timedOut, truncated, duration_ms: Date.now() - started, stdout, stderr });
+    });
+  });
+}"""
+WORKFLOW_CAPTURE_FIXED = WORKFLOW_CAPTURE_OLD.replace(
+    "maxBytes = 256 * 1024 }", "maxBytes = 256 * 1024, stream = false }",
+).replace(
+    "{ cwd, windowsHide: true }", "{ cwd, windowsHide: true, stdio: stream ? 'inherit' : 'pipe' }",
+).replace("child.stdout.on", "child.stdout?.on").replace("child.stderr.on", "child.stderr?.on")
+WORKFLOW_CLI = "dev/skill/scripts/wf.mjs"
+WORKFLOW_RUN_OLD = "    const result = await runCommand(selected.command, note.cwd ? path.resolve(root, note.cwd) : root, { timeoutMs });"
+WORKFLOW_RUN_FIXED = WORKFLOW_RUN_OLD.replace(
+    "{ timeoutMs }", "{ timeoutMs, stream: !options.json && process.env.MOSAIC_WORKFLOW_STREAM === '1' }",
+)
+SETUP_RECIPE = "dev/wf/setup.wf.md"
+SETUP_DOWNLOAD_OLD = "                Invoke-WebRequest -Uri (Get-Url $kind $tagNames[$tagKey] $vendorPath) -OutFile $staged"
+SETUP_DOWNLOAD_FIXED = '                Write-Host "setup: downloading $repoPath ($kind)"\n' + SETUP_DOWNLOAD_OLD
 SHADERS = ("voxel.vert", "voxel.frag")
 
 
@@ -108,9 +144,12 @@ def mosaic_toolchain(checkout, explicit=None):
 
 
 def correct_mosaic_workflows(checkout, git):
-    """Validate both recorded corrections before changing either pinned workflow."""
+    """Validate all recorded corrections before changing pinned workflow sources."""
     corrections = ((LLVM_SETUP_RECIPE, LLVM_HASH_OLD, LLVM_HASH_FIXED),
-                   (BOOTSTRAP_RECIPE, BOOTSTRAP_STAGE_OLD, BOOTSTRAP_STAGE_FIXED))
+                   (BOOTSTRAP_RECIPE, BOOTSTRAP_STAGE_OLD, BOOTSTRAP_STAGE_FIXED),
+                   (WORKFLOW_RUNNER, WORKFLOW_CAPTURE_OLD, WORKFLOW_CAPTURE_FIXED),
+                   (WORKFLOW_CLI, WORKFLOW_RUN_OLD, WORKFLOW_RUN_FIXED),
+                   (SETUP_RECIPE, SETUP_DOWNLOAD_OLD, SETUP_DOWNLOAD_FIXED))
     status = subprocess.run(
         [git, "-C", str(checkout), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
         check=True, text=True, capture_output=True,
@@ -140,7 +179,41 @@ def correct_mosaic_workflows(checkout, git):
             pending.append((path, corrected))
     for path, corrected in pending:
         (checkout / path).write_bytes(corrected)
-        print(f"Applied renderer's pinned workflow correction: {path}")
+        print(f"Applied renderer's pinned workflow correction: {path}", flush=True)
+
+
+def run_setup_workflow(command, checkout, env):
+    options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    process = subprocess.Popen(command, cwd=checkout, env=env, **options)
+    try:
+        returncode = process.wait()
+    except KeyboardInterrupt:
+        print("\nStopping this setup's process tree...", flush=True)
+        previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            if os.name == "nt":
+                stopped = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, text=True, timeout=15, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                if stopped.returncode:
+                    raise BuildError(f"Could not stop setup process tree {process.pid}; cache may still be in use: {stopped.stdout}{stopped.stderr}".strip())
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=5)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise BuildError(f"Could not stop setup process tree {process.pid}; cache may still be in use: {error}") from error
+        finally:
+            signal.signal(signal.SIGINT, previous_handler)
+        raise
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command)
 
 
 def setup_mosaic(directory):
@@ -171,10 +244,14 @@ def setup_mosaic(directory):
     env["MOSAIC_ROOT"] = str(checkout / "src")
     env["MOSAIC_BOOTSTRAP_REMOTE"] = "origin"
     env["MOSAIC_BOOTSTRAP_BRANCH"] = "bootstrap"
+    env["MOSAIC_WORKFLOW_STREAM"] = "1"
     for name in ("MOSAIC_BUILD_COMPILER", "MOSAIC_BUILD_SELF_ONLY", "MOSAIC_BUILD_LANE", "MOSAIC_BUILD_NO_INSTALL"):
         env.pop(name, None)
-    for workflow in ("setup", "bootstrap"):
-        subprocess.run([node, "dev/skill/scripts/wf.mjs", "run", workflow], cwd=checkout, env=env, check=True)
+    if os.name == "nt":
+        print("First Windows setup downloads dependencies and builds LLVM 22.1.8 from source; this can take substantial time. Existing caches are reused.", flush=True)
+    for index, workflow in enumerate(("setup", "bootstrap"), 1):
+        print(f"[{index}/2] Mosaic {workflow}: live output enabled", flush=True)
+        run_setup_workflow([node, "dev/skill/scripts/wf.mjs", "run", workflow], checkout, env)
     owned_compiler = checkout / "bin" / ("mosaic.exe" if os.name == "nt" else "mosaic")
     _, compiler, _ = mosaic_toolchain(checkout, str(owned_compiler))
     subprocess.run([compiler, "version"], cwd=checkout, env=env, check=True)
@@ -261,6 +338,9 @@ def main(argv=None):
         if args.command == "run":
             return subprocess.run([str(output)], cwd=ROOT, env=env).returncode
         return 0
+    except KeyboardInterrupt:
+        print("\nBuild interrupted." + (" Setup caches are kept; rerun python tools/build.py setup to continue." if args.command == "setup" else ""), file=sys.stderr)
+        return 130
     except (BuildError, OSError, subprocess.CalledProcessError) as error:
         print(f"build: {error}", file=sys.stderr)
         return 1

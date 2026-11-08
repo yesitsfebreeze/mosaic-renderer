@@ -5,11 +5,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import shutil
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -118,6 +122,11 @@ class ToolchainSetupChecks(unittest.TestCase):
         recipe.parent.mkdir(parents=True)
         recipe.write_text(RECIPE, encoding="utf-8")
         (self.origin / build.BOOTSTRAP_RECIPE).write_text("# Build fixture\n```win\n" + build.BOOTSTRAP_STAGE_OLD + "\n```\n", encoding="utf-8")
+        (self.origin / build.SETUP_RECIPE).write_text("# Setup fixture\n```win\n" + build.SETUP_DOWNLOAD_OLD + "\n```\n", encoding="utf-8")
+        runner = self.origin / build.WORKFLOW_RUNNER
+        runner.parent.mkdir(parents=True)
+        runner.write_text("import { spawn } from 'node:child_process';\n" + build.WORKFLOW_CAPTURE_OLD + "\n", encoding="utf-8")
+        (self.origin / build.WORKFLOW_CLI).write_text(build.WORKFLOW_RUN_OLD + "\n", encoding="utf-8")
         (self.origin / ".gitignore").write_text("bin/\n.mosaic/\n", encoding="utf-8")
         self.real_run = subprocess.run
         self.git(self.origin, "init", "-q")
@@ -136,6 +145,9 @@ class ToolchainSetupChecks(unittest.TestCase):
         patcher = patch.object(build.subprocess, "run", side_effect=self.run_command)
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = patch.object(build, "run_setup_workflow", side_effect=lambda command, checkout, env: self.run_command(command, cwd=checkout, env=env))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def git(self, directory, *args):
         return self.real_run(["git", "-C", str(directory), *args], check=True, text=True, capture_output=True)
@@ -147,6 +159,7 @@ class ToolchainSetupChecks(unittest.TestCase):
             self.assertEqual(kwargs["env"]["MOSAIC_ROOT"], str(self.checkout / "src"))
             self.assertEqual(kwargs["env"]["MOSAIC_BOOTSTRAP_REMOTE"], "origin")
             self.assertEqual(kwargs["env"]["MOSAIC_BOOTSTRAP_BRANCH"], "bootstrap")
+            self.assertEqual(kwargs["env"]["MOSAIC_WORKFLOW_STREAM"], "1")
             for name in ("MOSAIC_BUILD_COMPILER", "MOSAIC_BUILD_SELF_ONLY", "MOSAIC_BUILD_LANE", "MOSAIC_BUILD_NO_INSTALL"):
                 self.assertNotIn(name, kwargs["env"])
             if command[-1] == self.fail_workflow:
@@ -202,10 +215,80 @@ class ToolchainSetupChecks(unittest.TestCase):
         self.assertEqual(other.read_text(), "user source")
         self.assertEqual(recipe.read_bytes(), corrected)
 
-    def test_setup_validates_both_files_before_writing(self):
+    def test_setup_upgrades_previous_two_corrections_and_rejects_changed_runner(self):
         self.checkout.parent.mkdir(parents=True)
         self.git(self.checkout.parent, "clone", "-q", str(self.origin), str(self.checkout))
-        recipe = self.checkout / build.BOOTSTRAP_RECIPE
+        for path, before, after in ((RECIPE_PATH, build.LLVM_HASH_OLD, build.LLVM_HASH_FIXED),
+                                    (build.BOOTSTRAP_RECIPE, build.BOOTSTRAP_STAGE_OLD, build.BOOTSTRAP_STAGE_FIXED)):
+            source = self.checkout / path
+            data = source.read_bytes()
+            newline = b"\r\n" if b"\r\n" in data else b"\n"
+            source.write_bytes(data.replace(before.encode().replace(b"\n", newline), after.encode().replace(b"\n", newline)))
+        build.setup_mosaic(self.checkout)
+        runner = self.checkout / build.WORKFLOW_RUNNER
+        self.assertIn(build.WORKFLOW_CAPTURE_FIXED, runner.read_text())
+        self.assertIn(build.SETUP_DOWNLOAD_FIXED, (self.checkout / build.SETUP_RECIPE).read_text())
+        runner.write_text(runner.read_text() + "// user change\n", encoding="utf-8")
+        with self.assertRaisesRegex(build.BuildError, "unexpected changes"):
+            build.setup_mosaic(self.checkout)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js runs the actual workflow runner regression")
+    def test_nested_workflow_streams_before_exit_and_keeps_capture_mode(self):
+        build.setup_mosaic(self.checkout)
+        script = self.root / "nested.mjs"
+        script.write_text(
+            "import path from 'node:path';\n"
+            f"import {{ runCommand }} from {json.dumps((self.checkout / build.WORKFLOW_RUNNER).as_uri())};\n"
+            "const root = process.cwd(), note = {cwd: null}, timeoutMs = 10000;\n"
+            "const options = {json: process.argv.includes('--json')};\n"
+            "const child = String.raw`const fs = require('node:fs');\n"
+            "process.stdout.write('live stdout\\n'); process.stderr.write('live stderr\\n');\n"
+            "const timer = setInterval(() => { if (fs.existsSync(process.argv[1])) { clearInterval(timer); process.exit(7); } }, 10);\n"
+            "setTimeout(() => process.exit(99), 8000).unref();`;\n"
+            "const selected = {command: process.argv[2] === 'outer'\n"
+            " ? [process.execPath, process.argv[1], 'inner', process.argv[3], ...(options.json ? ['--json'] : [])]\n"
+            " : [process.execPath, '-e', child, process.argv[3]]};\n"
+            + (self.checkout / build.WORKFLOW_CLI).read_text()
+            + "if (options.json) console.log(JSON.stringify(result));\n"
+            "else process.stdout.write(result.stdout + result.stderr);\n"
+            "process.exit(result.exit_code);\n", encoding="utf-8")
+        env = dict(os.environ, MOSAIC_WORKFLOW_STREAM="1")
+        gate = self.root / "release"
+        command = [shutil.which("node"), str(script), "outer", str(gate)]
+        process = subprocess.Popen(command, cwd=self.root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        lines = queue.Queue()
+        reader = threading.Thread(target=lambda: [lines.put(line) for line in process.stdout], daemon=True)
+        reader.start()
+        try:
+            first = [lines.get(timeout=4), lines.get(timeout=4)]
+            self.assertEqual(set(first), {"live stdout\n", "live stderr\n"})
+            self.assertIsNone(process.poll(), "output must arrive while the leaf process still waits")
+        finally:
+            gate.touch()
+            process.wait(timeout=5)
+            reader.join(timeout=2)
+            process.stdout.close()
+        self.assertEqual(process.returncode, 7)
+        self.assertTrue(lines.empty(), "streamed output must not replay when nested workflows exit")
+        for stream, json_output in (("0", False), ("1", True)):
+            with self.subTest(stream=stream, json=json_output):
+                env["MOSAIC_WORKFLOW_STREAM"] = stream
+                result = self.real_run(command + (["--json"] if json_output else []), cwd=self.root, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 7)
+                self.assertEqual(result.stderr, "")
+                if json_output:
+                    outer = json.loads(result.stdout)
+                    inner = json.loads(outer["stdout"])
+                    self.assertEqual(inner["stdout"], "live stdout\n")
+                    self.assertEqual(inner["stderr"], "live stderr\n")
+                    self.assertEqual(outer["exit_code"], 7)
+                else:
+                    self.assertEqual(result.stdout, "live stdout\nlive stderr\n")
+
+    def test_setup_validates_all_files_before_writing(self):
+        self.checkout.parent.mkdir(parents=True)
+        self.git(self.checkout.parent, "clone", "-q", str(self.origin), str(self.checkout))
+        recipe = self.checkout / build.WORKFLOW_CLI
         recipe.write_bytes(recipe.read_bytes() + b"# user change\n")
         with self.assertRaisesRegex(build.BuildError, "unexpected changes"):
             build.setup_mosaic(self.checkout)
@@ -328,6 +411,100 @@ class ToolchainSetupChecks(unittest.TestCase):
         self.assertEqual(self.workflows, ["setup", "bootstrap"])
         self.assertEqual(self.verified, [])
         self.assertTrue((self.checkout / ".git").is_dir())
+
+    def test_interrupted_setup_exits_cleanly(self):
+        with patch.object(build, "setup_mosaic", side_effect=KeyboardInterrupt):
+            self.assertEqual(build.main(["setup"]), 130)
+
+
+class WorkflowCancellationChecks(unittest.TestCase):
+    def test_interrupt_stops_descendant_and_releases_cache_lock(self):
+        with tempfile.TemporaryDirectory(prefix="setup process tree ") as directory:
+            root = Path(directory)
+            leaf = root / "lock_holder.py"
+            leaf.write_text(
+                "import os, sys, time\nfrom pathlib import Path\n"
+                "root = Path(sys.argv[1])\n"
+                "handle = (root / 'cache.lock').open('w+b')\nhandle.write(b'x'); handle.flush(); handle.seek(0)\n"
+                "if os.name == 'nt':\n import msvcrt\n msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)\n"
+                "else:\n import fcntl\n fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "(root / 'ready').write_text(str(os.getpid()))\ntime.sleep(30)\n", encoding="utf-8")
+            wrapper = root / "workflow.py"
+            wrapper.write_text(
+                "import subprocess, sys\n"
+                "subprocess.run([sys.executable, sys.argv[1], sys.argv[2]], check=True)\n", encoding="utf-8")
+            command = [sys.executable, str(wrapper), str(leaf), str(root)]
+            real_wait = subprocess.Popen.wait
+            interrupted = False
+
+            def interrupt_after_lock(process, *args, **kwargs):
+                nonlocal interrupted
+                if process.args == command and not interrupted:
+                    deadline = time.monotonic() + 5
+                    while not (root / "ready").exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue((root / "ready").exists(), "descendant failed to acquire fixture cache lock")
+                    interrupted = True
+                    raise KeyboardInterrupt
+                return real_wait(process, *args, **kwargs)
+
+            released = False
+            try:
+                with patch.object(subprocess.Popen, "wait", interrupt_after_lock):
+                    with self.assertRaises(KeyboardInterrupt):
+                        build.run_setup_workflow(command, root, dict(os.environ))
+                with (root / "cache.lock").open("r+b") as handle:
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(handle, fcntl.LOCK_UN)
+                released = True
+                self.assertEqual((root / "cache.lock").read_bytes(), b"x", "cache files must be retained")
+            finally:
+                if not released and (root / "ready").exists():
+                    pid = int((root / "ready").read_text())
+                    if os.name == "nt":
+                        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+                    else:
+                        try:
+                            os.kill(pid, 9)
+                        except ProcessLookupError:
+                            pass
+
+    def test_workflow_failure_is_not_reported_as_success(self):
+        command = [sys.executable, "-c", "raise SystemExit(9)"]
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            build.run_setup_workflow(command, Path.cwd(), dict(os.environ))
+        self.assertEqual(failure.exception.returncode, 9)
+
+    def test_failed_cleanup_restores_interrupt_handler_and_reports_cache_owner(self):
+        command = ["fixture setup"]
+        previous = build.signal.getsignal(build.signal.SIGINT)
+        calls = 0
+
+        def waiting(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise KeyboardInterrupt
+            self.assertEqual(build.signal.getsignal(build.signal.SIGINT), build.signal.SIG_IGN)
+            raise subprocess.TimeoutExpired(command, 5)
+
+        def stop_tree(*args, **kwargs):
+            self.assertEqual(build.signal.getsignal(build.signal.SIGINT), build.signal.SIG_IGN)
+            raise subprocess.TimeoutExpired(command, 15)
+
+        with patch.object(build.subprocess, "Popen") as launch, patch.object(build.os, "killpg", create=True), patch.object(build.subprocess, "run", side_effect=stop_tree):
+            launch.return_value.pid = 12345
+            launch.return_value.wait.side_effect = waiting
+            with self.assertRaisesRegex(build.BuildError, "process tree 12345; cache may still be in use"):
+                build.run_setup_workflow(command, Path.cwd(), dict(os.environ))
+        self.assertEqual(build.signal.getsignal(build.signal.SIGINT), previous)
 
 
 if __name__ == "__main__":
