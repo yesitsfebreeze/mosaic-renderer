@@ -1,13 +1,14 @@
 # Mosaic Renderer
 
-A native Mosaic/Vulkan renderer for the Matter64 cell model. The first milestone
-is a deterministic **32 × 32 × 32** reference scene with full cubes and exact
-diagonal half cells, a 256-entry material table, an orbit camera and shadows.
+A native Mosaic/Vulkan renderer for a **32 × 32 × 32 cube standing on one vertex**.
+Three axis RLE stores provide six opposite-face views of the same geometry.
+Fractional endpoints and transverse bounds retain partial cells; separate runs
+preserve cavities and gaps. Materials and changing properties use lookup tables.
 
-The application draws one fullscreen triangle and traces the cell field. Scene
-data stays in one GPU storage buffer. Primary and shadow rays intersect the same
-cell geometry. The current scene is static; painting, simulation, refraction,
-global illumination and multiple chunks are subsequent milestones.
+The application draws one fullscreen triangle. Primary and shadow rays traverse
+RLE columns from a single GPU storage buffer, without a dense GPU cell fallback.
+The current scene is static; painting, simulation, refraction, global illumination
+and multiple chunks remain subsequent milestones.
 
 ## Build and run
 
@@ -91,21 +92,30 @@ CI runs Python build checks on Linux and Windows. The Windows job also executes
 the corrected PowerShell hash expression and bootstrap stage with paths containing
 spaces. It checks recipe cache hashes, real tar extraction, native library/helper
 access through the junction, failure handling and preservation of the root cache.
-These fixtures do not compile Mosaic. Linux compiles and validates the Vulkan shaders and runs
-77 geometry fixtures using the actual intersection code through WebGL2/SwiftShader.
-Native Mosaic compilation, Vulkan window creation and hardware performance remain
-separate target-machine checks.
+These fixtures do not compile Mosaic.
+
+Linux compiles and validates Vulkan SPIR-V, then executes the production GLSL
+intersection and property functions in a surfaceless OpenGL 4.5 context using Mesa.
+The test only adapts resource bindings and the entry point. Hand-expected fixtures
+cover all six directions, depth 32, gaps, 32 alternating runs, fractional bounds,
+inside starts, material interfaces, shadow offsets and arbitrary property IDs.
+Seeded rays are also compared against an independent intersection oracle over the
+original boxes. Cooling-state fixtures check that changing temperature leaves
+geometry unchanged.
 
 ```sh
-python -m unittest discover -s tests -v
+python -B -m unittest discover -s tests -v
 python tools/build.py shaders
-npm install --no-save --no-package-lock playwright@1.62.1
-npx playwright install --with-deps chromium
+# Linux geometry test dependencies; no npm or Python packages are required.
+sudo apt-get install --no-install-recommends libegl1 libgl1 libgl1-mesa-dri
 node tests/geometry.mjs
 ```
 
-Playwright and Chromium are development-only test dependencies. An existing
-Chromium executable can be selected with `CHROMIUM_EXECUTABLE`.
+The geometry check uses Node.js, Python 3 and Mesa EGL/OpenGL. `PYTHON` selects a
+Python executable. It defaults to software rendering, so these checks do not
+measure Vulkan performance. Native Mosaic compilation, native builder execution,
+window creation and hardware performance require separate target-machine checks.
+The native builder includes packed-data assertions executed when it builds the scene.
 
 ## Controls and measurement
 
@@ -123,35 +133,70 @@ when supported. Frame time includes presentation and can be limited by VSync.
 claim yet. Record the GPU, framebuffer resolution, presentation mode and scene
 alongside any benchmark.
 
-## Cell and material contract
+## RLE and property contract
 
-The dense grid has 32,768 cells, stored with index `x + 32 * (y + 32 * z)`.
-Each cell is one 32-bit word:
+The cube keeps local axes X/Y/Z while its body diagonal points upward in world
+space. Camera and lighting vectors are transformed into that local frame.
+Each axis has 32 × 32 columns. Opposite faces read the same ordered intervals in
+reverse: `[a, b)` becomes `[32 - b, 32 - a)`. This needs three stores, not six
+independently updated copies.
 
-| Bits | Meaning |
+The CPU prepares explicit cell boxes and builds all three views from those same
+boxes. Only touching runs with matching material, state and transverse bounds
+merge. The GPU reads only the packed column/run representation. Every column can
+retain up to 32 runs, including alternating material boundaries.
+
+Depths use 1/256-cell fixed point in unsigned 16-bit fields. Coordinates cover
+**0 through 32 inclusive**, so the far boundary encodes as 8192. The endpoint's
+fraction is a boundary position; occupied volume depends on all three extents.
+Changing a temperature or emission value never changes those extents.
+
+The storage buffer begins with 16 words:
+
+| Header word | Value |
 | --- | --- |
-| 0–7 | Material ID; 0 is empty, 1–255 are material entries |
-| 8–15 | Shape: 0 is a full cube, 1–26 are oriented half cells |
-| 16–31 | Reserved; zero |
+| 0 | Grid size, 32 |
+| 1–3 | Column word offset, run word offset, run count |
+| 4–5 | Material word offset, material count |
+| 6–7 | State word offset, state count |
+| 8–9 | Property word offset, property count |
+| 10 | Total buffer word count |
+| 11–15 | Reserved, zero |
 
-For a half cell, decode `k = shape - 1`, then increment `k` when `k >= 13`.
-The plane normal is `(k % 3 - 1, (k / 3) % 3 - 1, k / 9 - 1)`, using integer
-division. The occupied half satisfies `dot(normal, local_position - 0.5) <= 0`.
-The plane passes through the cell center, so every orientation occupies exactly
-half the cube's volume. A diagonal half cube is a clipped cube, not a tetrahedron.
-Material opacity and shape occupancy are separate fields.
+For axis `a`, transverse axes are `u = (a + 1) % 3` and `v = (a + 2) % 3`.
+The column index is `a * 32 * 32 + uCoordinate + 32 * vCoordinate`. Each column
+stores two words: first run **record index** and run count. Each four-word run
+contains packed 16-bit start/end depths, an 8-bit material ID plus 24-bit state ID,
+and packed 16-bit lower/upper transverse fractions for U/V. Transverse bounds are
+relative to the column and range from 0 to 256. Material zero denotes air.
 
-After the cell words, the same buffer contains 256 material records, eight words
-each: an albedo/opacity `vec4` followed by metallic/roughness/emission/F0 `vec4`.
-Words preserve the floats' IEEE-754 bit patterns. The complete buffer is 136 KiB.
-The shader uses a 128-byte camera uniform at set 0, binding 1, and the scene buffer
-at binding 2. `level.y` is the material table's first word offset.
+The 256-entry material table retains eight float words per entry: albedo/opacity
+followed by metallic/roughness/emission/F0. Words preserve IEEE-754 bit patterns.
+A two-word state record gives its first property **record index** and count.
+Every property record has 20 words: an arbitrary unsigned ID, component count
+1–4, two reserved zero words, then four float vectors `base`, `gx`, `gy`, `gz`.
+ID zero is a valid property ID. Values at cube-local position `p` are:
+
+```text
+value = base + gx * p.x + gy * p.y + gz * p.z
+```
+
+The shader recognizes temperature in kelvin (ID 1), emission multiplier (ID 2)
+and tint (ID 3); other IDs remain accessible through the same lookup functions.
+This is an explicit affine field per state. Additional changes in a property
+require another state/segment; endpoints alone cannot encode arbitrary internal
+variation. Geometry is rectangular run prisms, without diagonal half-cell shapes
+or an inferred smooth surface.
+
+The camera uniform remains 128 bytes at set 0, binding 1; the scene buffer is
+binding 2. Storage size depends on run and property counts. RLE saves space on
+long uniform spans, with no fixed compression or FPS guarantee.
 
 ## Next milestones
 
 1. Verify the native reference scene and timing on the target machine, including
-   all half-cell orientations, adjacent surfaces and camera positions.
-2. Add picking and a cursor-sized emitter using the same cell intersection rules,
+   fractional boundaries, adjacent surfaces, all six face views and inside starts.
+2. Add picking and a cursor-sized emitter using the same RLE intersection rules,
    updating persistent GPU buffers.
 3. Connect adjacent 32³ chunks into one continuous field, then add a shared
    material-driven simulation with explicit boundary exchange.

@@ -29,6 +29,14 @@ struct Hit {
     float distance;
     vec3 normal;
     uint material;
+    uint state;
+};
+
+struct Run {
+    vec3 lower;
+    vec3 upper;
+    uint material;
+    uint state;
 };
 
 uint sceneWord(uint index) {
@@ -64,107 +72,134 @@ bool boxSpan(vec3 origin, vec3 direction, vec3 lower, vec3 upper, out Span span)
     return span.leave >= 0.0;
 }
 
-vec3 halfNormal(uint shape) {
-    int code = int(shape) - 1;
-    if (code >= 13) ++code;
-    return vec3(code % 3 - 1, (code / 3) % 3 - 1, code / 9 - 1);
+vec2 fixedPair(uint encoded) {
+    return vec2(encoded & 65535u, encoded >> 16u) * (1.0 / 256.0);
 }
 
-bool cellSpan(uint cell, ivec3 coordinate, vec3 origin, vec3 direction, out Span span) {
-    uint material = cell & 255u;
-    uint shape = (cell >> 8u) & 255u;
-    if (material == 0u || shape > 26u) return false;
+uvec2 columnRuns(int axis, ivec2 coordinate, int size) {
+    uint column = uint(axis * size * size + coordinate.x + size * coordinate.y);
+    uint index = sceneWord(1u) + column * 2u;
+    return uvec2(sceneWord(index), sceneWord(index + 1u));
+}
 
-    if (!boxSpan(origin, direction, vec3(coordinate), vec3(coordinate + 1), span)) return false;
-    if (shape != 0u) {
-        vec3 normal = halfNormal(shape);
-        float side = dot(normal, origin - vec3(coordinate) - 0.5);
-        float slope = dot(normal, direction);
-        if (slope == 0.0) {
-            if (side > 0.0) return false;
-        } else {
-            float cut = -side / slope;
-            if (slope < 0.0 && cut > span.enter) {
-                span.enter = cut;
-                span.enterNormal = normalize(normal);
-            }
-            if (slope > 0.0 && cut < span.leave) {
-                span.leave = cut;
-                span.leaveNormal = normalize(normal);
-            }
+Run loadRun(uint record, int axis, ivec2 coordinate) {
+    uint index = sceneWord(2u) + record * 4u;
+    vec2 depth = fixedPair(sceneWord(index));
+    uint identity = sceneWord(index + 1u);
+    vec2 lower = vec2(coordinate) + fixedPair(sceneWord(index + 2u));
+    vec2 upper = vec2(coordinate) + fixedPair(sceneWord(index + 3u));
+    int u = (axis + 1) % 3;
+    int v = (axis + 2) % 3;
+    Run run;
+    run.lower[axis] = depth.x;
+    run.upper[axis] = depth.y;
+    run.lower[u] = lower.x;
+    run.upper[u] = upper.x;
+    run.lower[v] = lower.y;
+    run.upper[v] = upper.y;
+    run.material = identity & 255u;
+    run.state = identity >> 8u;
+    return run;
+}
+
+bool originRun(vec3 origin, vec3 direction, int axis, int size, out Hit hit) {
+    if (any(lessThan(origin, vec3(0.0))) || any(greaterThan(origin, vec3(size)))) return false;
+    ivec2 axes = ivec2((axis + 1) % 3, (axis + 2) % 3);
+    ivec2 coordinate;
+    for (int i = 0; i < 2; ++i) {
+        int a = axes[i];
+        coordinate[i] = int(floor(origin[a]));
+        if (direction[a] > 0.0 && origin[a] == floor(origin[a])) --coordinate[i];
+        if (coordinate[i] < 0 || coordinate[i] >= size) return false;
+    }
+    uvec2 column = columnRuns(axis, coordinate, size);
+    for (uint i = 0u; i < column.y; ++i) {
+        Run run = loadRun(column.x + i, axis, coordinate);
+        Span span;
+        if (run.material != 0u && boxSpan(origin, direction, run.lower, run.upper, span)
+            && span.enter < 0.0 && span.leave >= 0.0) {
+            hit.distance = span.leave;
+            hit.normal = span.leaveNormal;
+            hit.material = run.material;
+            hit.state = run.state;
+            return true;
         }
     }
-    return span.leave > span.enter && span.leave >= 0.0;
+    return false;
 }
 
 bool trace(vec3 origin, vec3 direction, out Hit hit) {
-    int size = int(level.x);
+    int size = int(sceneWord(0u));
+    vec3 magnitude = abs(direction);
+    int axis = magnitude.y > magnitude.x ? 1 : 0;
+    if (magnitude.z > magnitude[axis]) axis = 2;
+    if (magnitude[axis] == 0.0) return false;
     Span bounds;
     if (!boxSpan(origin, direction, vec3(0.0), vec3(float(size)), bounds)) return false;
     float start = max(bounds.enter, 0.0);
     if (bounds.leave <= start) return false;
 
     vec3 position = origin + direction * start;
-    ivec3 coordinate = ivec3(floor(position));
-    ivec3 stepDirection = ivec3(sign(direction));
-    vec3 nextBoundary = vec3(FAR_DISTANCE);
-    for (int axis = 0; axis < 3; ++axis) {
-        if (direction[axis] < 0.0 && position[axis] == floor(position[axis])) --coordinate[axis];
-        coordinate[axis] = clamp(coordinate[axis], 0, size - 1);
-        if (direction[axis] != 0.0) {
-            int edge = coordinate[axis] + (direction[axis] > 0.0 ? 1 : 0);
-            nextBoundary[axis] = (float(edge) - origin[axis]) / direction[axis];
+    ivec2 axes = ivec2((axis + 1) % 3, (axis + 2) % 3);
+    ivec2 coordinate;
+    ivec2 stepDirection;
+    vec2 nextBoundary = vec2(FAR_DISTANCE);
+    for (int i = 0; i < 2; ++i) {
+        int a = axes[i];
+        coordinate[i] = int(floor(position[a]));
+        stepDirection[i] = int(sign(direction[a]));
+        if (direction[a] < 0.0 && position[a] == floor(position[a])) --coordinate[i];
+        coordinate[i] = clamp(coordinate[i], 0, size - 1);
+        if (direction[a] != 0.0) {
+            int edge = coordinate[i] + (direction[a] > 0.0 ? 1 : 0);
+            nextBoundary[i] = (float(edge) - origin[a]) / direction[a];
         }
     }
 
-    bool inside = false;
-    // A ray crosses at most 3*N cell planes in this single dense chunk.
-    for (int visit = 0; visit < 3 * size + 3; ++visit) {
-        uint index = uint(coordinate.x + size * (coordinate.y + size * coordinate.z));
-        uint cell = sceneWord(index);
-        Span span;
-        if (cellSpan(cell, coordinate, origin, direction, span)) {
-            uint material = cell & 255u;
+    bool inside = start == 0.0 && originRun(origin, direction, axis, size, hit);
+    float columnEnter = start;
+    bool positive = direction[axis] > 0.0;
+    // Depth advances by runs; only the two transverse grids need DDA crossings.
+    for (int visit = 0; visit < 2 * size + 1; ++visit) {
+        float columnLeave = min(bounds.leave, min(nextBoundary.x, nextBoundary.y));
+        uvec2 column = columnRuns(axis, coordinate, size);
+        for (uint i = 0u; i < column.y; ++i) {
+            uint offset = positive ? i : column.y - 1u - i;
+            Run run = loadRun(column.x + offset, axis, coordinate);
+            float nearDepth = positive ? run.lower[axis] : run.upper[axis];
+            float farDepth = positive ? run.upper[axis] : run.lower[axis];
+            if ((farDepth - origin[axis]) / direction[axis] <= columnEnter) continue;
+            if ((nearDepth - origin[axis]) / direction[axis] >= columnLeave) break;
+            Span span;
+            if (run.material == 0u || !boxSpan(origin, direction, run.lower, run.upper, span)
+                || span.leave <= columnEnter || span.enter >= columnLeave) continue;
             if (inside) {
-                if (material != hit.material || span.enter > hit.distance) return true;
+                if (run.material != hit.material || span.enter > hit.distance) return true;
             } else {
-                hit.material = material;
-                bool internalFace = false;
-                if (span.enter == 0.0 && start == 0.0) {
-                    ivec3 behind = ivec3(floor(origin));
-                    for (int axis = 0; axis < 3; ++axis) {
-                        if (direction[axis] > 0.0 && origin[axis] == floor(origin[axis])) --behind[axis];
-                    }
-                    if (all(greaterThanEqual(behind, ivec3(0))) && all(lessThan(behind, ivec3(size))) && any(notEqual(behind, coordinate))) {
-                        uint previous = sceneWord(uint(behind.x + size * (behind.y + size * behind.z)));
-                        Span previousSpan;
-                        internalFace = (previous & 255u) == material && cellSpan(previous, behind, origin, direction, previousSpan)
-                            && previousSpan.enter < 0.0 && previousSpan.leave == 0.0;
-                    }
-                }
-                if (span.enter >= 0.0 && !internalFace) {
+                hit.material = run.material;
+                hit.state = run.state;
+                if (span.enter >= 0.0) {
                     hit.distance = span.enter;
                     hit.normal = span.enterNormal;
                     return true;
                 }
                 inside = true;
             }
-            // Continue through touching cells of the same material to its outer surface.
             hit.distance = span.leave;
             hit.normal = span.leaveNormal;
-        } else if (inside) {
-            return true;
+            hit.state = run.state;
         }
 
-        float nextDistance = min(nextBoundary.x, min(nextBoundary.y, nextBoundary.z));
-        if (inside && hit.distance < nextDistance) return true;
-        if (nextDistance >= bounds.leave) break;
-        for (int axis = 0; axis < 3; ++axis) {
-            if (nextBoundary[axis] <= nextDistance) {
-                coordinate[axis] += stepDirection[axis];
-                if (coordinate[axis] < 0 || coordinate[axis] >= size) return inside;
-                int edge = coordinate[axis] + (direction[axis] > 0.0 ? 1 : 0);
-                nextBoundary[axis] = (float(edge) - origin[axis]) / direction[axis];
+        if (inside && hit.distance < columnLeave) return true;
+        if (columnLeave >= bounds.leave) break;
+        columnEnter = columnLeave;
+        for (int i = 0; i < 2; ++i) {
+            if (nextBoundary[i] <= columnLeave) {
+                int a = axes[i];
+                coordinate[i] += stepDirection[i];
+                if (coordinate[i] < 0 || coordinate[i] >= size) return inside;
+                int edge = coordinate[i] + (direction[a] > 0.0 ? 1 : 0);
+                nextBoundary[i] = (float(edge) - origin[a]) / direction[a];
             }
         }
     }
@@ -172,8 +207,38 @@ bool trace(vec3 origin, vec3 direction, out Hit hit) {
 }
 
 vec4 materialVector(uint material, uint component) {
-    uint index = uint(level.y) + material * 8u + component;
+    uint index = sceneWord(4u) + material * 8u + component;
     return uintBitsToFloat(uvec4(sceneWord(index), sceneWord(index + 1u), sceneWord(index + 2u), sceneWord(index + 3u)));
+}
+
+vec4 propertyVector(uint record, uint component) {
+    uint index = sceneWord(8u) + record * 20u + 4u + component * 4u;
+    return uintBitsToFloat(uvec4(sceneWord(index), sceneWord(index + 1u), sceneWord(index + 2u), sceneWord(index + 3u)));
+}
+
+bool findProperty(uint state, uint property, out uint record) {
+    if (state >= sceneWord(7u)) return false;
+    uint index = sceneWord(6u) + state * 2u;
+    uint first = sceneWord(index);
+    uint count = sceneWord(index + 1u);
+    for (uint i = 0u; i < count; ++i) {
+        record = first + i;
+        if (sceneWord(sceneWord(8u) + record * 20u) == property) return true;
+    }
+    return false;
+}
+
+vec4 propertyValue(uint state, uint property, vec3 position, vec4 fallback) {
+    uint record;
+    if (!findProperty(state, property, record)) return fallback;
+    return propertyVector(record, 0u) + propertyVector(record, 1u) * position.x
+        + propertyVector(record, 2u) * position.y + propertyVector(record, 3u) * position.z;
+}
+
+vec4 propertyGradient(uint state, uint property, int axis) {
+    uint record;
+    if (axis < 0 || axis > 2 || !findProperty(state, property, record)) return vec4(0.0);
+    return propertyVector(record, uint(axis + 1));
 }
 
 void main() {
@@ -190,16 +255,22 @@ void main() {
 
     vec4 albedo = materialVector(hit.material, 0u);
     vec4 surface = materialVector(hit.material, 4u);
+    vec3 position = origin + direction * hit.distance;
+    albedo.rgb *= max(propertyValue(hit.state, 3u, position, vec4(1.0)).rgb, vec3(0.0));
+    float temperature = propertyValue(hit.state, 1u, position, vec4(293.15)).x;
+    float emission = max(propertyValue(hit.state, 2u, position, vec4(1.0)).x, 0.0);
     vec3 lightDirection = normalize(sun.xyz);
     float diffuse = max(dot(hit.normal, lightDirection), 0.0);
     float visibility = 1.0;
     if (screen.z > 0.5 && diffuse > 0.0) {
-        vec3 position = origin + direction * hit.distance + hit.normal * SURFACE_OFFSET;
         Hit blocker;
-        if (trace(position, lightDirection, blocker)) visibility = 0.0;
+        if (trace(position + hit.normal * SURFACE_OFFSET, lightDirection, blocker)) visibility = 0.0;
     }
     float ambient = mix(0.16, 0.32, dot(hit.normal, normalize(sky.xyz)) * 0.5 + 0.5);
-    vec3 colour = albedo.rgb * (ambient + diffuse * visibility * 0.85 + surface.z);
+    float heat = clamp((temperature - 700.0) / 1000.0, 0.0, 2.0);
+    vec3 incandescence = vec3(1.0, 0.16 + 0.24 * heat, 0.025 + 0.1 * heat * heat) * heat * heat;
+    vec3 colour = albedo.rgb * (ambient + diffuse * visibility * 0.85)
+        + emission * (albedo.rgb * surface.z + incandescence);
     colour = colour / (vec3(1.0) + colour);
     outColor = vec4(pow(max(colour, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
 }

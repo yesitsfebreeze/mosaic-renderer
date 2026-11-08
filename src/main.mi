@@ -10,8 +10,6 @@ use mosaic_runtime:channels
 
 FOV :: f32(45)
 VIEW :: [3]f32{0.55, 0.60, 0.72}
-# The reference scene spans cells y=1 through y=9, including their outer faces.
-FOCUS :: [3]f32{0, CUBE_SIZE * (5.5 / f32(GRID_SIZE) - 0.5), 0}
 SUN :: [3]f32{0.45, 0.80, 0.35}
 Quat :: [4]f32
 
@@ -78,9 +76,16 @@ proc quat_rotate(q: Quat, v: [3]f32) -> [3]f32
     u := q.xyz
     return v + 2 * cross(u, cross(u, v) + q.w * v)
 
+proc world_to_field(v: [3]f32) -> [3]f32
+    # The local (1, 1, 1) diagonal is world up; rays and lights use its inverse.
+    s: f32 = 0.7071067811865475
+    t: f32 = 0.5773502691896258
+    u: f32 = 0.4082482904638630
+    return {s * v.x + t * v.y - u * v.z, -s * v.x + t * v.y - u * v.z, t * v.y + 2 * u * v.z}
+
 proc reset_view()
     app.orientation = {0, 0, 0, 1}
-    app.distance = 18
+    app.distance = 24
 
 proc init()
     gpu, err := vk.gpu_init()
@@ -105,17 +110,17 @@ proc init()
     app.gfx_ready = true
 
     app.shader = gfx.make_shader(mem.slice_to_bytes(voxel_vert_spv[:]), mem.slice_to_bytes(voxel_frag_spv[:]))
-    app.pipeline = gfx.screen_pipeline(app.shader, "voxel reference")
+    app.pipeline = gfx.screen_pipeline(app.shader, "RLE field")
     # The shared runtime descriptor set requires valid textures even for an SSBO-only pass.
     white := [4]u8{255, 255, 255, 255}
     app.placeholder = gfx.make_image({type = .D2, width = 1, height = 1, num_slices = 1, num_mipmaps = 1, pixel_format = .RGBA8, data = {ptr = &white, size = 4}, label = "unused texture"})
     app.texture = gfx.make_view({texture = {image = app.placeholder}, label = "unused texture"})
     app.sampler = gfx.make_sampler({label = "unused sampler"})
     field_generate(&app.field)
-    app.buffer = gfx.make_buffer({usage = {storage_buffer = true}, data = {ptr = raw_data(app.field.words), size = uint(len(app.field.words) * 4)}, label = "cells and materials"})
-    app.view = gfx.make_view({storage_buffer = {buffer = app.buffer}, label = "cells and materials"})
+    app.buffer = gfx.make_buffer({usage = {storage_buffer = true}, data = {ptr = raw_data(app.field.words), size = uint(len(app.field.words) * 4)}, label = "RLE columns and properties"})
+    app.view = gfx.make_view({storage_buffer = {buffer = app.buffer}, label = "RLE columns and properties"})
     app.ready = true
-    fmt.printfln("Mosaic Renderer: %s | %d^3 | %d materials | %d KiB", app.gpu.device_name, GRID_SIZE, MATERIAL_COUNT, len(app.field.words) * 4 / 1024)
+    fmt.printfln("Mosaic Renderer: %s | %d^3 | %d RLE runs | %d materials | %d KiB", app.gpu.device_name, GRID_SIZE, app.field.words[3], MATERIAL_COUNT, len(app.field.words) * 4 / 1024)
     fmt.println("Drag: orbit | Wheel: zoom | R: reset | S: shadows | Esc: quit")
     if !app.renderer.gpu_timing: fmt.println("GPU timestamp measurements are unavailable on this device.")
 
@@ -139,14 +144,14 @@ proc frame()
     up := cross(right, forward)
     p := &app.params
     p.eye = {0, 0, 0, math.tan(FOV * math.RAD_PER_DEG / 2)}
-    p.eye.xyz = FOCUS + quat_rotate(inverse, eye)
+    p.eye.xyz = world_to_field(quat_rotate(inverse, eye))
     p.right = {0, 0, 0, gfx.widthf() / gfx.heightf()}
-    p.right.xyz = quat_rotate(inverse, right)
-    p.up.xyz = quat_rotate(inverse, up)
-    p.forward.xyz = quat_rotate(inverse, forward)
-    p.sun.xyz = quat_rotate(inverse, normalize(SUN))
-    p.sky.xyz = quat_rotate(inverse, {0, 1, 0})
-    p.level = {f32(GRID_SIZE), f32(CELL_COUNT), CUBE_SIZE / 2, 0}
+    p.right.xyz = world_to_field(quat_rotate(inverse, right))
+    p.up.xyz = world_to_field(quat_rotate(inverse, up))
+    p.forward.xyz = world_to_field(quat_rotate(inverse, forward))
+    p.sun.xyz = world_to_field(normalize(SUN))
+    p.sky.xyz = world_to_field({0, 1, 0})
+    p.level = {f32(GRID_SIZE), f32(app.field.words[4]), CUBE_SIZE / 2, 0}
     p.screen = {gfx.widthf(), gfx.heightf(), 1 if app.shadows else 0, 0}
 
     zone := vk.gpu_zone_begin(rawptr(&app.ctx), "gpu.voxel")
