@@ -1,0 +1,9 @@
+/vendor/
+/node_modules/
+/build/
+/.mosaic/cache/
+/.mosaic/tmp/
+/src/gen_shaders.mi
+__pycache__/
+*.pyc
+video.cfg
