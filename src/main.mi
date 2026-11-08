@@ -1,0 +1,231 @@
+package main
+
+use core:fmt
+use core:math
+use core:mem
+use core:os
+use mosaic_runtime:vk as vk
+use mosaic_runtime:vk/gfx as gfx
+use mosaic_runtime:channels
+
+FOV :: f32(45)
+VIEW :: [3]f32{0.55, 0.60, 0.72}
+# The reference scene spans cells y=1 through y=9, including their outer faces.
+FOCUS :: [3]f32{0, CUBE_SIZE * (5.5 / f32(GRID_SIZE) - 0.5), 0}
+SUN :: [3]f32{0.45, 0.80, 0.35}
+Quat :: [4]f32
+
+# std140, set 0 binding 1. Material records live in the storage buffer, not this block.
+Params :: struct
+    eye:     [4]f32,
+    right:   [4]f32,
+    up:      [4]f32,
+    forward: [4]f32,
+    sun:     [4]f32,
+    sky:     [4]f32,
+    level:   [4]f32,
+    screen:  [4]f32,
+
+App :: struct
+    gpu:            vk.GPU,
+    memory:         vk.Memory,
+    renderer:       vk.Renderer,
+    ctx:            vk.Context,
+    field:          Field,
+    buffer:         gfx.Buffer,
+    view:           gfx.View,
+    placeholder:    gfx.Image,
+    texture:        gfx.View,
+    sampler:        gfx.Sampler,
+    shader:         gfx.Shader,
+    pipeline:       gfx.Pipeline,
+    params:         Params,
+    orientation:    Quat,
+    distance:       f32,
+    dragging:       bool,
+    shadows:        bool,
+    frames:         u64,
+    memory_ready:   bool,
+    renderer_ready: bool,
+    gfx_ready:      bool,
+    ready:          bool,
+    failed:         bool,
+
+app: App
+
+proc dot(a, b: [3]f32) -> f32
+    return a.x * b.x + a.y * b.y + a.z * b.z
+
+proc cross(a, b: [3]f32) -> [3]f32
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}
+
+proc normalize(v: [3]f32) -> [3]f32
+    return v / math.sqrt(dot(v, v))
+
+proc quat_axis(axis: [3]f32, angle: f32) -> Quat
+    s := math.sin(angle / 2)
+    return {axis.x * s, axis.y * s, axis.z * s, math.cos(angle / 2)}
+
+proc quat_mul(a, b: Quat) -> Quat
+    return {
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+    }
+
+proc quat_rotate(q: Quat, v: [3]f32) -> [3]f32
+    u := q.xyz
+    return v + 2 * cross(u, cross(u, v) + q.w * v)
+
+proc reset_view()
+    app.orientation = {0, 0, 0, 1}
+    app.distance = 18
+
+proc init()
+    gpu, err := vk.gpu_init()
+    app.gpu = gpu
+    if err != ""
+        app.failed = true
+        fmt.printfln("Vulkan: %s", err)
+        vk.request_quit()
+        return
+    app.memory = vk.memory_init(&app.gpu)
+    app.memory_ready = true
+    renderer, rerr := vk.renderer_init(&app.gpu, &app.memory, vk.video_config_read().mode)
+    app.renderer = renderer
+    app.renderer_ready = true
+    if rerr != ""
+        app.failed = true
+        fmt.printfln("Renderer: %s", rerr)
+        vk.request_quit()
+        return
+    app.ctx = vk.Context{gpu = &app.gpu, memory = &app.memory, renderer = &app.renderer, hwnd = vk.native_window(), refresh_hz = app.renderer.refresh}
+    gfx.bind(&app.ctx)
+    app.gfx_ready = true
+
+    app.shader = gfx.make_shader(mem.slice_to_bytes(voxel_vert_spv[:]), mem.slice_to_bytes(voxel_frag_spv[:]))
+    app.pipeline = gfx.screen_pipeline(app.shader, "voxel reference")
+    # The shared runtime descriptor set requires valid textures even for an SSBO-only pass.
+    white := [4]u8{255, 255, 255, 255}
+    app.placeholder = gfx.make_image({type = .D2, width = 1, height = 1, num_slices = 1, num_mipmaps = 1, pixel_format = .RGBA8, data = {ptr = &white, size = 4}, label = "unused texture"})
+    app.texture = gfx.make_view({texture = {image = app.placeholder}, label = "unused texture"})
+    app.sampler = gfx.make_sampler({label = "unused sampler"})
+    field_generate(&app.field)
+    app.buffer = gfx.make_buffer({usage = {storage_buffer = true}, data = {ptr = raw_data(app.field.words), size = uint(len(app.field.words) * 4)}, label = "cells and materials"})
+    app.view = gfx.make_view({storage_buffer = {buffer = app.buffer}, label = "cells and materials"})
+    app.ready = true
+    fmt.printfln("Mosaic Renderer: %s | %d^3 | %d materials | %d KiB", app.gpu.device_name, GRID_SIZE, MATERIAL_COUNT, len(app.field.words) * 4 / 1024)
+    fmt.println("Drag: orbit | Wheel: zoom | R: reset | S: shadows | Esc: quit")
+    if !app.renderer.gpu_timing: fmt.println("GPU timestamp measurements are unavailable on this device.")
+
+proc frame()
+    if !app.ready: return
+    channels.frame_begin()
+    defer channels.frame_end()
+    if !vk.context_frame_begin(&app.ctx)
+        if app.renderer.failed
+            app.failed = true
+            vk.request_quit()
+        return
+    defer vk.context_frame_end(&app.ctx)
+    app.frames += 1
+
+    q := app.orientation
+    inverse := Quat{-q.x, -q.y, -q.z, q.w}
+    eye := normalize(VIEW) * app.distance
+    forward := normalize(-eye)
+    right := normalize(cross(forward, {0, 1, 0}))
+    up := cross(right, forward)
+    p := &app.params
+    p.eye = {0, 0, 0, math.tan(FOV * math.RAD_PER_DEG / 2)}
+    p.eye.xyz = FOCUS + quat_rotate(inverse, eye)
+    p.right = {0, 0, 0, gfx.widthf() / gfx.heightf()}
+    p.right.xyz = quat_rotate(inverse, right)
+    p.up.xyz = quat_rotate(inverse, up)
+    p.forward.xyz = quat_rotate(inverse, forward)
+    p.sun.xyz = quat_rotate(inverse, normalize(SUN))
+    p.sky.xyz = quat_rotate(inverse, {0, 1, 0})
+    p.level = {f32(GRID_SIZE), f32(CELL_COUNT), CUBE_SIZE / 2, 0}
+    p.screen = {gfx.widthf(), gfx.heightf(), 1 if app.shadows else 0, 0}
+
+    zone := vk.gpu_zone_begin(rawptr(&app.ctx), "gpu.voxel")
+    gfx.begin_pass({swapchain = gfx.swapchain()})
+    gfx.apply_pipeline(app.pipeline)
+    bindings: gfx.Bindings
+    for &view in bindings.views: view = app.texture
+    for &sampler in bindings.samplers: sampler = app.sampler
+    bindings.views[gfx.VIEW_fs_scene] = app.view
+    bindings.views[gfx.VIEW_level_casters] = {}
+    gfx.apply_bindings(bindings)
+    gfx.apply_uniforms(gfx.UB_fs_params, p, size_of(Params))
+    gfx.draw_screen_triangle()
+    gfx.end_pass()
+    vk.gpu_zone_end(rawptr(&app.ctx), zone)
+
+    if app.frames % 120 == 0
+        frame_ms := vk.frame_duration() * 1000
+        if app.renderer.gpu_timing
+            gpu_ms: f64 = 0
+            measured := false
+            for c in channels.get().channels
+                if c.name == "gpu.voxel"
+                    gpu_ms = c.last
+                    measured = true
+            if measured: fmt.printfln("frame %.2f ms | GPU voxel %.2f ms", frame_ms, gpu_ms)
+            else: fmt.printfln("frame %.2f ms | GPU sample pending", frame_ms)
+        else
+            fmt.printfln("frame %.2f ms | GPU timestamps unavailable", frame_ms)
+
+proc event(e: ^vk.Event)
+    @partial switch e.type
+    case .MOUSE_DOWN
+        if e.mouse_button == .LEFT: app.dragging = true
+    case .MOUSE_UP
+        if e.mouse_button == .LEFT: app.dragging = false
+    case .UNFOCUSED
+        app.dragging = false
+    case .MOUSE_MOVE
+        if !app.dragging: break
+        right := normalize(cross(-VIEW, {0, 1, 0}))
+        turn := quat_mul(quat_axis({0, 1, 0}, e.mouse_dx * 0.006), quat_axis(right, e.mouse_dy * 0.006))
+        app.orientation = quat_mul(turn, app.orientation)
+        q := app.orientation
+        app.orientation /= math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+    case .MOUSE_SCROLL
+        app.distance = clamp(app.distance - e.scroll_y * 0.8, 5, 60)
+    case .KEY_DOWN
+        if e.key_repeat: break
+        @partial switch e.key_code
+        case .ESCAPE
+            vk.request_quit()
+        case .R
+            reset_view()
+        case .S
+            app.shadows = !app.shadows
+
+proc cleanup()
+    if app.gfx_ready
+        gfx.wait_idle()
+        gfx.destroy_pipeline(app.pipeline)
+        gfx.destroy_shader(app.shader)
+        gfx.destroy_view(app.view)
+        gfx.destroy_buffer(app.buffer)
+        gfx.destroy_view(app.texture)
+        gfx.destroy_image(app.placeholder)
+        gfx.destroy_sampler(app.sampler)
+        gfx.unbind()
+    field_destroy(&app.field)
+    if app.renderer_ready: vk.renderer_destroy(&app.renderer)
+    if app.memory_ready: vk.memory_destroy(&app.memory)
+    vk.gpu_destroy(&app.gpu)
+    channels.shutdown()
+
+proc main()
+    assert(size_of(Params) == 128)
+    reset_view()
+    app.shadows = true
+    if !vk.run({title = "Mosaic Renderer", width = 1280, height = 800}, {init = init, frame = frame, event = event, cleanup = cleanup})
+        fmt.println("Window creation failed.")
+        app.failed = true
+    if app.failed: os.exit(1)
