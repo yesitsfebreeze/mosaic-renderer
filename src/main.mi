@@ -1,12 +1,12 @@
 package main
 
-use core:fmt
-use core:math
-use core:mem
-use core:os
-use mosaic_runtime:vk as vk
-use mosaic_runtime:vk/gfx as gfx
-use mosaic_runtime:channels
+import "core:fmt"
+import "core:math"
+import "core:mem"
+import "core:os"
+import vk "mosaic_runtime:vk"
+import gfx "mosaic_runtime:vk/gfx"
+import "mosaic_runtime:channels"
 
 FOV :: f32(45)
 VIEW :: [3]f32{0.55, 0.60, 0.72}

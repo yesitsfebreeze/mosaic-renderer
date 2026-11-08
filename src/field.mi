@@ -1,6 +1,6 @@
 package main
 
-use core:math
+import "core:math"
 
 GRID_SIZE :: 32
 CELL_COUNT :: GRID_SIZE * GRID_SIZE * GRID_SIZE

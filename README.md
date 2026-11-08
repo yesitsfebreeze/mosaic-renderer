@@ -12,104 +12,54 @@ and multiple chunks remain subsequent milestones.
 
 ## Build and run
 
-From the renderer repository:
+Use your existing Mosaic development checkout and working compiler. From the
+renderer repository on Windows:
 
-```sh
-python tools/build.py setup
-python tools/build.py run
+```powershell
+python tools/build.py doctor --mosaic-root D:\dev\language
+python tools/build.py run --mosaic-root D:\dev\language
 ```
 
-Use `python3` if that is your Python command. `setup` checks out the required
-Mosaic source into ignored `vendor/mosaic`, detached at this required revision from Mosaic's `main` history:
+`--mosaic-root` is required for `doctor`, `build` and `run`. It selects the Mosaic
+repository root, which must contain `src/core` and the voxel runtime. The compiler
+defaults to its existing `bin/mosaic.exe` (`bin/mosaic` on Unix); `--compiler` can
+select another existing compiler. Build Mosaic in its own project when developing
+the language; renderer commands do not clone or modify that checkout, rebuild
+Mosaic or LLVM, or download toolchain dependencies.
 
-```text
-ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5
+The build accepts advancing revisions and uncommitted Mosaic changes. Renderer
+syntax and runtime usage were reviewed against `14a1f880e`; this is a reference,
+not a revision requirement. Native renderer compilation against that revision
+still needs target-machine verification. Future language or runtime API changes
+may require renderer updates indicated by compiler diagnostics.
+
+The renderer requires Python 3.9+, the Vulkan SDK's `glslc` or
+`glslangValidator`, and a Vulkan 1.3 device/driver. Use `python3` if that is your
+Python command. Linux links system GLFW. `doctor` checks dependency paths and
+runs the selected compiler's `version` command; it does not create a Vulkan window.
+
+The build sets `MOSAIC_ROOT` to the selected checkout's **src directory** and
+exposes `dev/examples/voxel/runtime` through the `mosaic_runtime` collection.
+`--shader-compiler` selects the GLSL compiler. Shader-only builds do not need
+Mosaic:
+
+```powershell
+python tools/build.py shaders
+python tools/build.py build --mosaic-root D:\dev\language
+python tools/build.py build --mosaic-root D:\dev\language --debug
 ```
 
-It runs Mosaic's official `wf.mjs run setup` and `wf.mjs run bootstrap` there,
-then checks that checkout's `bin/mosaic` (`mosaic.exe` on Windows). Bootstrap
-builds from Mosaic's private C++ seed and pinned stage compiler. Setup prints
-phase labels, identifies Windows vendor downloads, and streams output from nested
-workflows as they run.
-
-If setup fails or is interrupted, rerun the same command and keep `vendor/mosaic`.
-Completed downloads and LLVM source/object caches are reused; interrupted downloads
-may restart. During setup/bootstrap workflows, Ctrl+C stops their child process
-tree so held cache locks are released, then exits with code 130 and a short
-cancellation message.
-An existing directory with another repository, revision or source changes is refused,
-apart from the recorded dependency corrections described below.
-
-At this pin, `dev/wf/setup-llvm.wf.md` tries to hash a literal
-`(Get-Location).Path/justfile` path. Renderer setup corrects that single line to
-hash the actual LLVM workflow file with SHA-256, so LLVM's cache records track
-the recipe that produced them. Setup also corrects the bootstrap stage in
-`dev/wf/build.wf.md`: it uses Windows' System32 tar for drive-letter paths and
-temporarily exposes the prepared native toolchain to the extracted stage sources
-through a directory junction. Required LLVM and tommath libraries are checked
-first. The junction is removed after stage compilation, including on failure;
-the original toolchain cache is retained.
-
-Setup also corrects `dev/wf/setup.wf.md` to label individual Windows downloads,
-and `dev/skill/scripts/wf.mjs` and `dev/skill/scripts/lib/wfmd.mjs` to support live
-output through nested workflows. Renderer setup enables this mode; normal
-structured workflow capture remains available. These progress changes do not
-reduce LLVM compilation work.
-
-These are renderer-owned dependency corrections. The Mosaic revision stays
-pinned, and no archive checksum is changed. Setup checks all guarded files
-against their committed originals and Git checkout filters before changing any
-of them. Retries accept exactly these unstaged changes; other edits, file mode
-changes, staged changes and untracked source files are refused.
-
-Setup requires Git authenticated for the private
-[Mosaic repository](https://github.com/yesitsfebreeze/mosaic), Node.js 22+, Python
-3.9+, and Mosaic's [native build prerequisites](https://github.com/yesitsfebreeze/mosaic/blob/ab4f95d210bbaf4369fc471173c1a10b9ed1dcc5/dev/README.md).
-On Windows, install PowerShell 7 and Visual Studio's C++ tools with its CMake/Ninja
-component. A cold Windows setup downloads vendor libraries and the pinned tool
-archive, then builds LLVM 22.1.8 from source. This can take substantial time;
-`MOSAIC_LLVM_JOBS` controls LLVM build parallelism. Later setup retries reuse
-completed downloads and the LLVM build cache.
-
-Rendering also requires the Vulkan SDK's `glslc` or `glslangValidator` and a Vulkan
-1.3 device/driver. Linux links system GLFW. `setup` does not require a shader
-compiler; `doctor` checks the rendering build dependencies. Native window creation
-and performance still need verification on the target machine.
-
-`run` uses the selected checkout's compiler by default. An existing compatible
-checkout can be selected explicitly:
-
-```sh
-python tools/build.py run --mosaic-root ../mosaic
-```
-
-Use `setup --mosaic-root <empty-directory>` to prepare a different isolated tool
-directory. `--compiler` deliberately overrides the compiler for build/run, and
-`--shader-compiler` selects the shader compiler. The build sets `MOSAIC_ROOT` to
-the selected checkout's **src directory** and exposes its runtime through the
-`mosaic_runtime` collection. Normal build/run commands do not download dependencies
-or rebuild Mosaic.
-
-```sh
-python tools/build.py shaders  # Compile GLSL without requiring Mosaic
-python tools/build.py build    # Generate shaders and compile the native application
-python tools/build.py build --debug
-```
-
-Generated shaders and executables stay in ignored `src/gen_shaders.mi` and `build/`.
-Shader generation replaces the generated file only after both shaders compile.
-If `spirv-val` is installed, the build also validates their SPIR-V.
+Generated renderer files stay in ignored `src/gen_shaders.mi` and `build/`.
+Shader generation replaces the generated file only after both shaders compile;
+when `spirv-val` is installed, it also validates their SPIR-V. Ctrl+C stops the
+active native command's child process tree before returning exit code 130.
 
 ## Checks
 
-CI runs Python build checks on Linux and Windows. Node.js is required for the
-workflow-output regression checks. Cancellation checks start a real descendant
-holding an OS file lock and verify that the lock can be reacquired after cleanup.
-The Windows job also executes
-the corrected PowerShell hash expression and bootstrap stage with paths containing
-spaces. It checks recipe cache hashes, real tar extraction, native library/helper
-access through the junction, failure handling and preservation of the root cache.
-These fixtures do not compile Mosaic.
+CI runs Python build checks on Linux and Windows. These cover external checkout
+selection, compiler arguments, shader generation and process cancellation.
+The checks use compiler fixtures; they do not build Mosaic or verify native
+renderer compilation.
 
 Linux compiles and validates Vulkan SPIR-V, then executes the production GLSL
 intersection and property functions in a surfaceless OpenGL 4.5 context using Mesa.
