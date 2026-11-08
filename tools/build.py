@@ -73,7 +73,7 @@ def compile_shaders(compiler):
         for name in SHADERS:
             source = ROOT / "src" / "shaders" / name
             target = Path(temporary) / (name + ".spv")
-            if "glslangvalidator" in Path(compiler).stem.lower():
+            if Path(compiler).stem.lower() in ("glslang", "glslangvalidator"):
                 flags = ["-V", "--target-env", "vulkan1.3", "-Os"]
             else:
                 flags = ["--target-env=vulkan1.3", "-O"]

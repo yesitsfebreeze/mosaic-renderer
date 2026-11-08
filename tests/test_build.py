@@ -76,6 +76,23 @@ class BuildChecks(unittest.TestCase):
         self.assertIn("-out:/a build/renderer", command)
         self.assertEqual(command[-1], "-o:speed")
 
+    def test_glslang_resolved_names_use_glslang_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+
+            def compile_glslang(command, **kwargs):
+                self.assertEqual(command[1:5], ["-V", "--target-env", "vulkan1.3", "-Os"])
+                self.assertNotIn("--target-env=vulkan1.3", command)
+                Path(command[-1]).write_bytes(HEADER)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.object(build, "ROOT", root), patch.object(build.shutil, "which", return_value=None):
+                with patch.object(build.subprocess, "run", side_effect=compile_glslang):
+                    for name in ("glslang", "glslangValidator", "glslang.exe", "glslangValidator.exe"):
+                        with self.subTest(compiler=name):
+                            build.compile_shaders(str(root / name))
+
 
 if __name__ == "__main__":
     unittest.main()
